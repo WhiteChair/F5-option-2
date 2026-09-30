@@ -1,0 +1,8 @@
+{
+  "name": "f5-option-2",
+  "private": true,
+  "description": "F5 option 2 — KBC-style voice message PoC for a blocked account",
+  "scripts": {
+    "start": "npx serve public"
+  }
+}
