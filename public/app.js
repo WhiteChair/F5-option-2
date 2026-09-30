@@ -7,6 +7,8 @@ const customer = {
   card: "Debit ••4419"
 };
 
+const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+
 const state = {
   tab: "home",
   recording: false,
@@ -16,10 +18,14 @@ const state = {
   timer: null,
   recognition: null,
   recorder: null,
+  stream: null,
   chunks: [],
   audioUrl: null,
   result: null,
-  cases: []
+  cases: [],
+  error: "",
+  status: "",
+  lang: "en-GB"
 };
 
 const screen = document.getElementById("screen");
@@ -120,17 +126,28 @@ function voiceView() {
         <h1>Leave a message</h1>
         <p>Up to 30 seconds. We transcribe it, open a CRM case, and propose a resolution.</p>
       </div>
+      ${state.error ? `<div class="banner">${escapeHtml(state.error)}</div>` : ""}
       <div class="timer">${formatTime(state.seconds)} / 0:30</div>
       <div class="bars" id="bars">${bars(live)}</div>
-      <button class="mic ${live ? "live" : ""}" id="micBtn" type="button" aria-label="${live ? "Stop recording" : "Start recording"}">${live ? "\u25a0" : "\u25cf"}</button>
-      <div class="note" style="text-align:center">${live ? "Listening\u2026 tap to stop" : "Tap to record. Chrome or Edge works best."}</div>
-      <div class="transcript">${text ? escapeHtml(text) : "<em>Transcript appears here while you speak.</em>"}</div>
+      <button class="mic ${live ? "live" : ""}" id="micBtn" type="button">${live ? "Stop" : "Record"}</button>
+      <div class="note" id="statusLine" style="text-align:center">${escapeHtml(statusLine())}</div>
+      <label class="field-label" for="transcript">Transcript</label>
+      <textarea id="transcript" rows="4" placeholder="Speech appears here. You can also type.">${escapeHtml(text)}</textarea>
       <div class="chips">
-        <button type="button" data-script="My account is blocked. I tried to pay at the bakery and the debit card was declined. I think I entered the wrong PIN at the ATM yesterday. Please unblock it.">Use blocked-account script</button>
+        <button type="button" data-lang="en-GB" class="${state.lang === "en-GB" ? "on" : ""}">English</button>
+        <button type="button" data-lang="nl-BE" class="${state.lang === "nl-BE" ? "on" : ""}">Nederlands</button>
+        <button type="button" data-script="My account is blocked. I tried to pay at the bakery and the debit card was declined. I think I entered the wrong PIN at the ATM yesterday. Please unblock it.">Blocked-account script</button>
       </div>
       <button class="primary" id="sendBtn" type="button" ${text && !live ? "" : "disabled"}>Send message</button>
     </div>
   `;
+}
+
+function statusLine() {
+  if (state.recording) return state.status || "Listening… tap Stop when you are done.";
+  if (!Speech && !navigator.mediaDevices) return "This browser cannot record. Type the message or use the script.";
+  if (!Speech) return "Live transcription needs Chrome or Edge. You can still record, then type what you said.";
+  return "Tap Record and allow the microphone. Chrome or Edge transcribes as you speak.";
 }
 
 function resultView(r) {
@@ -155,9 +172,9 @@ function resultView(r) {
         <span>Status</span><b>${crm.status}</b>
       </div>
       <div class="resolve">
-        <strong>${r.resolution.title}</strong>
-        <p>${r.resolution.detail}</p>
-        <p class="note">${r.resolution.why}</p>
+        <strong>${escapeHtml(r.resolution.title)}</strong>
+        <p>${escapeHtml(r.resolution.detail)}</p>
+        <p class="note">${escapeHtml(r.resolution.why)}</p>
       </div>
       <div class="stack">
         ${r.resolution.actions.map((a) => `<button class="primary action-btn" type="button" data-action="${escapeHtml(a.id)}">${escapeHtml(a.label)}</button>`).join("")}
@@ -182,11 +199,24 @@ function bind() {
   const mic = document.getElementById("micBtn");
   if (mic) mic.onclick = () => (state.recording ? stopRecording(false) : startRecording());
   const send = document.getElementById("sendBtn");
-  if (send) send.onclick = () => submit((state.transcript + " " + state.interim).trim());
+  if (send) send.onclick = () => submit(currentText());
+  const box = document.getElementById("transcript");
+  if (box) box.oninput = () => {
+    state.transcript = box.value;
+    state.interim = "";
+    if (send) send.disabled = state.recording || !box.value.trim();
+  };
   document.querySelectorAll("[data-script]").forEach((el) => {
     el.onclick = () => {
       state.transcript = el.dataset.script;
       state.interim = "";
+      state.error = "";
+      render();
+    };
+  });
+  document.querySelectorAll("[data-lang]").forEach((el) => {
+    el.onclick = () => {
+      state.lang = el.dataset.lang;
       render();
     };
   });
@@ -196,6 +226,7 @@ function bind() {
     state.transcript = "";
     state.interim = "";
     state.seconds = 0;
+    state.error = "";
     if (state.audioUrl) URL.revokeObjectURL(state.audioUrl);
     state.audioUrl = null;
     render();
@@ -205,87 +236,177 @@ function bind() {
   });
 }
 
+function currentText() {
+  const box = document.getElementById("transcript");
+  return ((box && box.value) || state.transcript || "").trim();
+}
+
 async function startRecording() {
+  state.error = "";
   state.transcript = "";
   state.interim = "";
   state.seconds = 0;
   state.chunks = [];
   state.recording = true;
+  state.status = "Asking for the microphone…";
   render();
 
-  const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!window.isSecureContext) {
+    fail("Recording needs a secure page. Open the https link.");
+    return;
+  }
+
   if (Speech) {
-    const rec = new Speech();
-    rec.lang = "en-GB";
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.onresult = (event) => {
-      let finalText = "";
-      let interim = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const piece = event.results[i][0].transcript;
-        if (event.results[i].isFinal) finalText += piece + " ";
-        else interim += piece;
-      }
-      if (finalText) state.transcript = (state.transcript + " " + finalText).trim();
-      state.interim = interim;
-      const box = document.querySelector(".transcript");
-      if (box) box.textContent = (state.transcript + " " + state.interim).trim();
-    };
-    rec.onerror = () => {};
-    try { rec.start(); state.recognition = rec; } catch (e) { state.recognition = null; }
+    startSpeech();
+    armTimer();
+    return;
   }
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const recorder = new MediaRecorder(stream);
-    recorder.ondataavailable = (e) => { if (e.data.size) state.chunks.push(e.data); };
-    recorder.onstop = () => {
-      stream.getTracks().forEach((t) => t.stop());
-      if (state.audioUrl) URL.revokeObjectURL(state.audioUrl);
-      state.audioUrl = URL.createObjectURL(new Blob(state.chunks, { type: recorder.mimeType || "audio/webm" }));
-    };
-    recorder.start();
-    state.recorder = recorder;
-  } catch (e) {
-    state.recorder = null;
+    await startMedia();
+    state.status = "Recording. This browser cannot transcribe live — type what you said, then send.";
+    const line = document.getElementById("statusLine");
+    if (line) line.textContent = state.status;
+    armTimer();
+  } catch (err) {
+    fail(micMessage(err));
   }
+}
 
+function startSpeech() {
+  const rec = new Speech();
+  rec.lang = state.lang;
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+  rec.onresult = (event) => {
+    let finalText = "";
+    let interim = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const piece = event.results[i][0].transcript;
+      if (event.results[i].isFinal) finalText += piece + " ";
+      else interim += piece;
+    }
+    if (finalText) state.transcript = (state.transcript + " " + finalText).replace(/\s+/g, " ").trim();
+    state.interim = interim;
+    const box = document.getElementById("transcript");
+    if (box && document.activeElement !== box) box.value = (state.transcript + " " + state.interim).trim();
+  };
+  rec.onerror = (event) => {
+    const code = event.error || "unknown";
+    if (code === "aborted" || code === "no-speech") return;
+    if (code === "not-allowed" || code === "service-not-allowed") {
+      fail("Microphone blocked. Allow the mic for this site in the address bar, then tap Record again.");
+      return;
+    }
+    state.status = "Speech engine error: " + code + ". You can type the message instead.";
+    const line = document.getElementById("statusLine");
+    if (line) line.textContent = state.status;
+  };
+  rec.onend = () => {
+    if (!state.recording || state.recognition !== rec) return;
+    try { rec.start(); } catch (e) {}
+  };
+  try {
+    rec.start();
+    state.recognition = rec;
+    state.status = "Listening… speak about the blocked card, then tap Stop.";
+    const line = document.getElementById("statusLine");
+    if (line) line.textContent = state.status;
+  } catch (err) {
+    fail("Could not start speech recognition. Type the message or use the script.");
+  }
+}
+
+async function startMedia() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  state.stream = stream;
+  const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+  const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  recorder.ondataavailable = (e) => { if (e.data.size) state.chunks.push(e.data); };
+  recorder.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    if (state.audioUrl) URL.revokeObjectURL(state.audioUrl);
+    if (state.chunks.length) {
+      state.audioUrl = URL.createObjectURL(new Blob(state.chunks, { type: recorder.mimeType || "audio/webm" }));
+    }
+  };
+  recorder.start();
+  state.recorder = recorder;
+}
+
+function armTimer() {
+  clearInterval(state.timer);
   state.timer = setInterval(() => {
     state.seconds += 1;
     const label = document.querySelector(".timer");
-    if (label) label.textContent = `${formatTime(state.seconds)} / 0:30`;
+    if (label) label.textContent = formatTime(state.seconds) + " / 0:30";
     const barsEl = document.getElementById("bars");
     if (barsEl) barsEl.innerHTML = bars(true);
     if (state.seconds >= 30) stopRecording(false);
   }, 1000);
 }
 
+function fail(message) {
+  state.recording = false;
+  state.error = message;
+  clearInterval(state.timer);
+  cleanupAudio();
+  render();
+}
+
 function stopRecording(discard) {
   state.recording = false;
   clearInterval(state.timer);
-  if (state.recognition) {
-    try { state.recognition.stop(); } catch (e) {}
-    state.recognition = null;
-  }
-  if (state.recorder && state.recorder.state !== "inactive") state.recorder.stop();
-  state.recorder = null;
+  cleanupAudio();
   if (discard) {
     state.transcript = "";
     state.interim = "";
+  } else {
+    state.transcript = currentText();
+    state.interim = "";
+    if (!state.transcript) {
+      state.error = "No speech detected. Type the message below, or use the blocked-account script.";
+    }
   }
   render();
 }
 
+function cleanupAudio() {
+  if (state.recognition) {
+    const rec = state.recognition;
+    state.recognition = null;
+    try { rec.onend = null; rec.stop(); } catch (e) {}
+  }
+  if (state.recorder && state.recorder.state !== "inactive") {
+    try { state.recorder.stop(); } catch (e) {}
+  }
+  state.recorder = null;
+  if (state.stream) {
+    state.stream.getTracks().forEach((t) => t.stop());
+    state.stream = null;
+  }
+}
+
+function micMessage(err) {
+  const name = err && err.name;
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return "Microphone blocked. Allow the mic for this site, then tap Record again.";
+  }
+  if (name === "NotFoundError") return "No microphone found on this device.";
+  return "Could not open the microphone. Type the message or use the script.";
+}
+
 async function submit(transcript) {
+  if (!transcript) return;
   const send = document.getElementById("sendBtn");
-  if (send) { send.disabled = true; send.textContent = "Opening CRM case\u2026"; }
+  if (send) { send.disabled = true; send.textContent = "Opening CRM case…"; }
   const payload = {
     transcript,
     durationSec: state.seconds || 12,
     customerId: customer.id,
     customerName: customer.name,
-    account: `${customer.accountName} ${customer.iban}`,
+    account: customer.accountName + " " + customer.iban,
     card: customer.card
   };
   let data;
@@ -297,9 +418,9 @@ async function submit(transcript) {
     });
     data = await res.json();
   } catch (e) {
-    data = localCase(payload);
+    data = analyzeClient(payload);
   }
-  if (!data.crm) data = localCase(payload);
+  if (!data.crm) data = analyzeClient(payload);
   state.result = data;
   state.cases.unshift(data.crm);
   state.tab = "voice";
@@ -311,14 +432,10 @@ function applyAction(id, label) {
   const stamp = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   if (state.cases[0]) {
     state.cases[0].status = id === "unblock" ? "Unblock requested" : id === "replace" ? "Replacement ordered" : "Callback queued";
-    state.cases[0].reaction = `${label} \u00b7 ${stamp}`;
+    state.cases[0].reaction = label + " · " + stamp;
   }
-  if (note) note.textContent = `${label}. CRM updated at ${stamp}. An agent does not need to take the call.`;
+  if (note) note.textContent = label + ". CRM updated at " + stamp + ". An agent does not need to take the call.";
   paintCrm();
-}
-
-function localCase(payload) {
-  return analyzeClient(payload);
 }
 
 function analyzeClient(payload) {
@@ -328,11 +445,11 @@ function analyzeClient(payload) {
   const resolution = blocked
     ? {
         title: "Unblock the debit card after a quick confirm",
-        detail: "Core banking mock: debit card \u2022\u20224419 was blocked after 3 incorrect PIN attempts at a Bancontact ATM in Berchem on 29 Sep, 18:42. Transfers and standing orders are unaffected.",
+        detail: "Core banking mock: debit card ••4419 was blocked after 3 incorrect PIN attempts at a Bancontact ATM in Berchem on 29 Sep, 18:42. Transfers and standing orders are unaffected.",
         why: "You are already signed in to KBC Mobile, so we can act without a phone agent.",
         actions: [
-          { id: "unblock", label: "Yes, that was me \u2014 unblock the card" },
-          { id: "replace", label: "That was not me \u2014 keep the block and send a new card" }
+          { id: "unblock", label: "Yes, that was me — unblock the card" },
+          { id: "replace", label: "That was not me — keep the block and send a new card" }
         ]
       }
     : {
@@ -357,7 +474,7 @@ function analyzeClient(payload) {
       confidence: blocked ? 0.93 : 0.55,
       durationSec: payload.durationSec,
       transcript: payload.transcript,
-      blockReason: blocked ? "3 incorrect PIN attempts \u00b7 ATM Berchem \u00b7 29 Sep 18:42" : null,
+      blockReason: blocked ? "3 incorrect PIN attempts · ATM Berchem · 29 Sep 18:42" : null,
       reaction: "Awaiting customer confirm"
     }
   };
@@ -365,17 +482,24 @@ function analyzeClient(payload) {
 
 function paintCrm() {
   if (!state.cases.length) {
-    crmList.innerHTML = `<div class="empty">No cases yet. Record a message about the blocked account.</div>`;
+    crmList.innerHTML = '<div class="empty">No cases yet. Record a message about the blocked account.</div>';
     return;
   }
-  crmList.innerHTML = state.cases.map((c) => `<pre>${escapeHtml(JSON.stringify(c, null, 2))}</pre>`).join("");
+  crmList.innerHTML = state.cases.map((c) => "<pre>" + escapeHtml(JSON.stringify(c, null, 2)) + "</pre>").join("");
 }
 
 function formatTime(s) {
-  return `0:${String(s).padStart(2, "0")}`;
+  return "0:" + String(s).padStart(2, "0");
 }
+
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+  return String(s).replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[ch]));
 }
 
 render();
